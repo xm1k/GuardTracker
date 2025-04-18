@@ -111,7 +111,8 @@ data class TaskN(
     val userId: Int,
     val objectId: Int,
     val description: String,
-    val status: Int
+    val status: Int,
+    val note: String = ""
 )
 data class Worker(val fullname: String, val id: Int)
 data class TaskItem(val description: String)
@@ -124,6 +125,29 @@ data class ObjectItem(
     val isDeleted: Boolean,
     val id: Int
 )
+
+suspend fun getTaskNote(token: Long, taskId: Int): String? = withContext(Dispatchers.IO) {
+    val jsonBody = JSONObject()
+        .put("token", token)
+        .toString()
+    val mediaType = "application/json; charset=utf-8".toMediaType()
+    val body = jsonBody.toRequestBody(mediaType)
+
+    val client = OkHttpClient.Builder().build()
+    val request = Request.Builder()
+        .url("http://194.169.160.248:10417/task/get/$taskId")
+        .post(body)
+        .build()
+
+    client.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) {
+            throw IOException("Ошибка сети: ${'$'}{response.code}")
+        }
+        val respString = response.body?.string() ?: throw IOException("Пустой ответ от сервера")
+        val json = JSONObject(respString)
+        json.optString("note", null)
+    }
+}
 
 suspend fun fetchTasks(token: Long, status: Int = -1): List<TaskN> = withContext(Dispatchers.IO) {
     val client = OkHttpClient.Builder().build()
@@ -457,26 +481,95 @@ class TaskCheckService : Service() {
         Log.d("TaskCheckService", "onStartCommand вызван")
         return START_STICKY
     }
+
+    private fun getStatusName(status: Int): String = when (status) {
+        0 -> "В ожидании"
+        1 -> "Завершена"
+        2 -> "Отклонена"
+        3 -> "В работе"
+        else -> "Неизвестный статус"
+    }
+
+    // Пример: получаем имя объекта по objectId
+    suspend fun getObjectName(token: Long, objectId: Int): String = withContext(Dispatchers.IO) {
+        // 1. Подготовка JSON-тела запроса
+        val jsonBody = JSONObject()
+            .put("token", token)
+            .toString()                                                    // org.json.JSONObject → String :contentReference[oaicite:4]{index=4}
+        val mediaType = "application/json; charset=utf-8".toMediaType()   // Расширение toMediaType() :contentReference[oaicite:5]{index=5}
+        val body = jsonBody.toRequestBody(mediaType)                      // toRequestBody() для создания RequestBody :contentReference[oaicite:6]{index=6}
+
+        // 2. Формирование и выполнение запроса
+        val client = OkHttpClient.Builder().build()                       // Создание клиента OkHttp :contentReference[oaicite:7]{index=7}
+        val request = Request.Builder()
+            .url("http://194.169.160.248:10417/object/get/$objectId")    // URL с objectId в пути :contentReference[oaicite:8]{index=8}
+            .post(body)
+            .build()
+
+        client.newCall(request).execute().use { response ->             // execute().use { … } для автоматического закрытия :contentReference[oaicite:9]{index=9}
+            if (!response.isSuccessful) {
+                throw IOException("Ошибка сети: ${response.code}")       // Бросаем IOException при не-2xx статусе :contentReference[oaicite:10]{index=10}
+            }
+            // 3. Парсим тело и вынимаем поле "name"
+            val respString = response.body?.string()
+                ?: throw IOException("Пустой ответ от сервера")
+            val json = JSONObject(respString)                            // Снова JSONObject для разбора ответа :contentReference[oaicite:11]{index=11}
+            json.optString("name", "Объект #$objectId")                  // Удобный optString с дефолтом
+        }
+    }
+
     private suspend fun checkTasks() {
         val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
         val token = prefs.getLong("token", 0L)
+        val role = prefs.getInt("role", 0)
         if (token == 0L) return
+
         try {
             val tasks = fetchTasks(token, -1)
-            val lastTaskIds = prefs.getStringSet("last_task_ids", emptySet()) ?: emptySet()
-            val currentTaskIds = tasks.map { it.id.toString() }.toSet()
-            val newTasks = tasks.filter { !lastTaskIds.contains(it.id.toString()) }
-//
-            newTasks.forEach { task -> showNotification("Задача", task.description) }
-            if (tasks.isNotEmpty()) {
-                prefs.edit().putStringSet("last_task_ids", currentTaskIds).apply()
-            } else if (lastTaskIds.isNotEmpty()) {
-                prefs.edit().remove("last_task_ids").apply()
+
+            val oldStatuses = tasks.associate { task ->
+                task.id to prefs.getInt("status_${task.id}", -1)
             }
+
+            val newTasks = tasks.filter { oldStatuses[it.id] == -1 }
+            val statusChanged = tasks.filter { oldStatuses[it.id] != -1 && oldStatuses[it.id] != it.status }
+
+            // Уведомление о смене статуса (для всех ролей)
+            statusChanged.forEach { task ->
+                val statusName = getStatusName(task.status)
+                val objectName = getObjectName(token, task.objectId)
+                showNotification(
+                    title = "Задача №${task.id} — статус обновлён",
+                    message = "$statusName (${task.status}) • $objectName"
+                )
+            }
+
+            // Уведомление о новых задачах (только если роль != 4)
+            if (role != 4) {
+                newTasks.forEach { task ->
+                    val objectName = getObjectName(token, task.objectId)
+                    showNotification(
+                        title = "Новая задача №${task.id}",
+                        message = "${task.description} • $objectName"
+                    )
+                }
+            }
+
+            // Обновляем статусы в prefs
+            prefs.edit().apply {
+                tasks.forEach { task ->
+                    putInt("status_${task.id}", task.status)
+                }
+                apply()
+            }
+
         } catch (e: Exception) {
             Log.e("TaskCheckService", "Ошибка получения задач: ${e.message}", e)
         }
     }
+
+
+
     private fun showNotification(title: String, message: String) {
         val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         val intent = Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK }
@@ -512,6 +605,8 @@ class TaskCheckService : Service() {
     }
     override fun onBind(intent: Intent?): IBinder? = null
 }
+
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1114,7 +1209,24 @@ fun TaskUpdateDialog(
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var selectedStatus by remember { mutableStateOf(task.status) }
     var menuExpanded by remember { mutableStateOf(false) }
+    var note by remember { mutableStateOf<String?>(null) }
+    var isLoadingNote by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
+    // Fetch note when status is "Отклонены"
+    LaunchedEffect(selectedStatus) {
+        if (selectedStatus == 2) {
+            isLoadingNote = true
+            note = null
+            try {
+                note = getTaskNote(token, task.id.toInt())
+            } catch (e: Exception) {
+                note = "Ошибка при загрузке причины: ${e.message}"
+            } finally {
+                isLoadingNote = false
+            }
+        }
+    }
 
     // Status options
     val statusOptions = listOf(
@@ -1149,18 +1261,18 @@ fun TaskUpdateDialog(
                 Text("Статус:", color = Color.White)
                 ExposedDropdownMenuBox(
                     expanded = menuExpanded && !isLoading,
-                    onExpandedChange = { if (!isLoading) menuExpanded = it },
+                    onExpandedChange = { if (!isLoading) menuExpanded = it }
                 ) {
                     TextField(
                         value = statusOptions.first { it.first == selectedStatus }.second,
-                        onValueChange = { },
+                        onValueChange = {},
                         readOnly = true,
                         trailingIcon = {
                             ExposedDropdownMenuDefaults.TrailingIcon(expanded = menuExpanded)
                         },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .menuAnchor()  // здесь!
+                            .menuAnchor()
                     )
                     ExposedDropdownMenu(
                         expanded = menuExpanded,
@@ -1176,6 +1288,33 @@ fun TaskUpdateDialog(
                             )
                         }
                     }
+                }
+
+                // Show reason if status == "Отклонены"
+                if (selectedStatus == 2) {
+                    Spacer(Modifier.height(16.dp))
+                    Text("Причина отклонения:", color = Color.White)
+                    if (isLoadingNote) {
+                        CircularProgressIndicator(
+                            modifier = Modifier
+                                .size(24.dp)
+                                .padding(vertical = 8.dp)
+                        )
+                    } else {
+                        OutlinedTextField(
+                            value = note.orEmpty(),
+                            onValueChange = {},
+                            readOnly = true,
+                            modifier = Modifier
+                                .fillMaxWidth(),
+                            singleLine = false
+                        )
+                    }
+                }
+
+                errorMessage?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(it, color = MaterialTheme.colorScheme.error)
                 }
             }
         },
