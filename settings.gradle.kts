@@ -19,6 +19,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "GuardTracker"
+rootProject.name = "SovaRouter"
 include(":app")
  
