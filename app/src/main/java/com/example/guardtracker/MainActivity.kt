@@ -102,8 +102,9 @@ import android.graphics.Color as GfxColor
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Add
-
-
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.style.TextAlign
+import androidx.activity.compose.BackHandler
 
 data class Task(val id: Int, val adminId: Int, val name: String, val latitude: Double, val longitude: Double, val description: String, val created: String)
 data class TaskN(
@@ -259,6 +260,35 @@ suspend fun createTask(
     }
 }
 
+suspend fun getWorkerName(token: Long, userId: Int): String = withContext(Dispatchers.IO) {
+    // 1. Подготовка JSON-тела запроса
+    val jsonBody = JSONObject()
+        .put("token", token)
+        .toString()
+    val mediaType = "application/json; charset=utf-8".toMediaType()
+    val body = jsonBody.toRequestBody(mediaType)
+
+    // 2. Формирование и выполнение HTTP‑запроса
+    val client = OkHttpClient.Builder().build()
+    val request = Request.Builder()
+        .url("http://194.169.160.248:10417/user/get/$userId")
+        .post(body)
+        .build()
+
+    client.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) {
+            throw IOException("Ошибка сети: ${response.code}")
+        }
+        // 3. Парсим JSON и вытаскиваем имя
+        val respString = response.body?.string()
+            ?: throw IOException("Пустой ответ от сервера")
+        val json = JSONObject(respString)
+        // полагаем, что поле с именем работника называется "fullname"
+        json.optString("fullname", "Работник #$userId")
+    }
+}
+
+
 
 suspend fun fetchObjects(token: Long): List<ObjectItem> = withContext(Dispatchers.IO) {
     val client = OkHttpClient.Builder().build()
@@ -374,6 +404,33 @@ suspend fun deleteWorker(token: Long, workerId: Int): JSONObject = withContext(D
     JSONObject(bodyString)
 }
 
+suspend fun getObjectName(token: Long, objectId: Int): String = withContext(Dispatchers.IO) {
+    // 1. Подготовка JSON-тела запроса
+    val jsonBody = JSONObject()
+        .put("token", token)
+        .toString()                                                    // org.json.JSONObject → String :contentReference[oaicite:4]{index=4}
+    val mediaType = "application/json; charset=utf-8".toMediaType()   // Расширение toMediaType() :contentReference[oaicite:5]{index=5}
+    val body = jsonBody.toRequestBody(mediaType)                      // toRequestBody() для создания RequestBody :contentReference[oaicite:6]{index=6}
+
+    // 2. Формирование и выполнение запроса
+    val client = OkHttpClient.Builder().build()                       // Создание клиента OkHttp :contentReference[oaicite:7]{index=7}
+    val request = Request.Builder()
+        .url("http://194.169.160.248:10417/object/get/$objectId")    // URL с objectId в пути :contentReference[oaicite:8]{index=8}
+        .post(body)
+        .build()
+
+    client.newCall(request).execute().use { response ->             // execute().use { … } для автоматического закрытия :contentReference[oaicite:9]{index=9}
+        if (!response.isSuccessful) {
+            throw IOException("Ошибка сети: ${response.code}")       // Бросаем IOException при не-2xx статусе :contentReference[oaicite:10]{index=10}
+        }
+        // 3. Парсим тело и вынимаем поле "name"
+        val respString = response.body?.string()
+            ?: throw IOException("Пустой ответ от сервера")
+        val json = JSONObject(respString)                            // Снова JSONObject для разбора ответа :contentReference[oaicite:11]{index=11}
+        json.optString("name", "Объект #$objectId")                  // Удобный optString с дефолтом
+    }
+}
+
 suspend fun deleteObject(token: Long, objectId: Int): JSONObject = withContext(Dispatchers.IO) {
     val client = OkHttpClient.Builder().build()
     val url = "http://194.169.160.248:10417/object/del/$objectId"
@@ -483,9 +540,9 @@ class TaskCheckService : Service() {
     }
 
     private fun getStatusName(status: Int): String = when (status) {
-        0 -> "В ожидании"
-        1 -> "Завершена"
-        2 -> "Отклонена"
+        0 -> "Ожидает"
+        1 -> "Сделано"
+        2 -> "Отклонено"
         3 -> "В работе"
         else -> "Неизвестный статус"
     }
@@ -782,10 +839,40 @@ fun LoginScreen(
 
 @Composable
 fun NextScreen(token: Long, role: Int) {
+    val activity = LocalContext.current as Activity
+    var tasks by remember { mutableStateOf<List<TaskN>?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var showDialog by remember { mutableStateOf(false) }
+
+    // Launch once to load tasks
+    LaunchedEffect(Unit) {
+        try {
+            tasks = fetchTasks(token)
+        } catch (e: Exception) {
+            error = e.localizedMessage ?: "Unknown error"
+            showDialog = true
+        }
+    }
+
+    // If error dialog is shown, intercept the back press to prevent going back
+    if (showDialog) {
+        BackHandler { /* consume back press */ }
+
+        AlertDialog.Builder(activity).apply {
+            setTitle("Ошибка сервера")
+            setMessage("Не удалось получить данные: $error\nПриложение будет закрыто.")
+            setCancelable(false)
+            setPositiveButton("Закрыть") { _, _ ->
+                activity.finishAffinity()
+            }
+        }.show()
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
-        // Карта на фоне
+        // Background map
         MapScreen(token = token, role = role)
-        // Поверх: или админ-панель, или список задач
+
+        // Foreground panel
         if (role == 4) {
             AdminPanel(
                 token = token,
@@ -803,8 +890,6 @@ fun NextScreen(token: Long, role: Int) {
         }
     }
 }
-
-
 
 @Composable
 fun AdminPanel(
@@ -825,6 +910,7 @@ fun AdminPanel(
     var showAddTaskDialog by remember { mutableStateOf(false) }
 
     // Refresh triggers and lists
+    var objectListRefresh by remember { mutableStateOf(0) }
     var workerListRefresh by remember { mutableStateOf(0) }
     var taskListRefresh by remember { mutableStateOf(0) }
     var statusListRefresh by remember { mutableStateOf(0) }
@@ -832,12 +918,14 @@ fun AdminPanel(
     var tasks by remember { mutableStateOf<List<TaskN>>(emptyList()) }
     var objects by remember { mutableStateOf<List<ObjectItem>>(emptyList()) }
 
-    val statusTitles = listOf("В ожидании", "Выполнены", "Отклонены", "В работе")
+    val statusTitles = listOf("Ожидает", "В работе", "Сделано", "Отклонено")
+    val statusCodes = listOf(0, 3, 1, 2)
 
     Surface(
         modifier = modifier,
         color = Color(0xFF212121),
-        tonalElevation = 8.dp
+        tonalElevation = 8.dp,
+        shape = RoundedCornerShape(16.dp)
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
             // Header
@@ -885,9 +973,13 @@ fun AdminPanel(
                 }
 
                 when (selectedTab) {
+
                     // Объекты
                     0 -> {
-                        LaunchedEffect(token) { objects = fetchObjects(token) }
+                        // Теперь перезагружаем при изменении objectListRefresh
+                        LaunchedEffect(token, objectListRefresh) {
+                            objects = fetchObjects(token)
+                        }
                         LazyColumn(
                             Modifier.fillMaxWidth().weight(1f)
                         ) {
@@ -899,10 +991,23 @@ fun AdminPanel(
                                         .clickable { selectedObject = obj },
                                     colors = CardDefaults.cardColors(containerColor = Color(0xFF424242))
                                 ) {
-                                    Text(obj.name, color = Color.White, modifier = Modifier.padding(16.dp))
+                                    Column(modifier = Modifier.padding(16.dp)) {
+                                        Text(
+                                            text = obj.name,
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Spacer(Modifier.height(4.dp))
+                                        Text(
+                                            text = "${obj.description}",
+                                            color = Color.Gray,
+                                            fontSize = 14.sp
+                                        )
+                                    }
                                 }
                             }
                         }
+
                     }
 
                     // Рабочие
@@ -920,10 +1025,23 @@ fun AdminPanel(
                                             .clickable { selectedWorker = w },
                                         colors = CardDefaults.cardColors(containerColor = Color(0xFF424242))
                                     ) {
-                                        Text(w.fullname, color = Color.White, modifier = Modifier.padding(16.dp))
+                                        Column(modifier = Modifier.padding(16.dp)) {
+                                            Text(
+                                                text = w.fullname,
+                                                color = Color.White,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                text = "id: ${w.id}",
+                                                color = Color.Gray,
+                                                fontSize = 14.sp
+                                            )
+                                        }
                                     }
                                 }
                             }
+
                             FloatingActionButton(
                                 onClick = { showAddWorkerDialog = true },
                                 modifier = Modifier
@@ -939,7 +1057,9 @@ fun AdminPanel(
                     2 -> {
                         // Fetch whenever token, refresh or status changes
                         LaunchedEffect(token, taskListRefresh, statusListRefresh, selectedStatusTab) {
-                            tasks = fetchTasks(token, status = selectedStatusTab)
+                            // берём из statusCodes по индексу вкладки
+                            val code = statusCodes[selectedStatusTab]
+                            tasks = fetchTasks(token, status = code)
                         }
                         Column(
                             Modifier.fillMaxWidth().weight(1f)
@@ -965,7 +1085,20 @@ fun AdminPanel(
                                             ),
                                             contentAlignment = Alignment.Center
                                         ) {
-                                            Text(title, color = Color.White, fontSize = 14.sp)
+                                            Text(
+                                                text = title,
+                                                color = Color.White,
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                textAlign = TextAlign.Center,
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .background(
+                                                        if (selectedStatusTab == idx) Color(0xFF424242)
+                                                        else Color.Transparent
+                                                    )
+                                                    .padding(vertical = 12.dp)  // при необходимости подправить отступы
+                                            )
                                         }
                                     }
                                 }
@@ -1018,7 +1151,10 @@ fun AdminPanel(
             token = token,
             obj = obj,
             onDismiss = { selectedObject = null },
-            onDeleteSuccess = { selectedObject = null }
+            onDeleteSuccess = {
+                selectedObject = null
+                objectListRefresh++
+            }
         )
     }
     selectedWorker?.let { w ->
@@ -1073,13 +1209,14 @@ fun AdminPanel(
 @Composable
 fun AddTaskDialog(
     token: Long,
+    initialObject: ObjectItem? = null,
     onDismissRequest: () -> Unit,
     onCreateSuccess: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var objects by remember { mutableStateOf<List<ObjectItem>>(emptyList()) }
     var workers by remember { mutableStateOf<List<Worker>>(emptyList()) }
-    var selectedObject by remember { mutableStateOf<ObjectItem?>(null) }
+    var selectedObject by remember { mutableStateOf(initialObject) }
     var expandedObj by remember { mutableStateOf(false) }
     var selectedWorker by remember { mutableStateOf<Worker?>(null) }
     var expandedWrk by remember { mutableStateOf(false) }
@@ -1091,11 +1228,10 @@ fun AddTaskDialog(
     }
 
     AlertDialog(
-        onDismissRequest = onDismissRequest,  // обязательный параметр :contentReference[oaicite:1]{index=1}
+        onDismissRequest = onDismissRequest,
         title = { Text("Новая задача") },
         text = {
             Column(Modifier.fillMaxWidth()) {
-                // Выбор объекта
                 ExposedDropdownMenuBox(
                     expanded = expandedObj,
                     onExpandedChange = { expandedObj = it }
@@ -1106,9 +1242,11 @@ fun AddTaskDialog(
                         readOnly = true,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .menuAnchor(), // нужен для Material3 :contentReference[oaicite:2]{index=2}
+                            .menuAnchor(),
                         label = { Text("Объект") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedObj) }
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedObj)
+                        }
                     )
                     ExposedDropdownMenu(
                         expanded = expandedObj,
@@ -1128,7 +1266,6 @@ fun AddTaskDialog(
 
                 Spacer(Modifier.height(8.dp))
 
-                // Выбор рабочего
                 ExposedDropdownMenuBox(
                     expanded = expandedWrk,
                     onExpandedChange = { expandedWrk = it }
@@ -1141,7 +1278,9 @@ fun AddTaskDialog(
                             .fillMaxWidth()
                             .menuAnchor(),
                         label = { Text("Работник") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedWrk) }
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedWrk)
+                        }
                     )
                     ExposedDropdownMenu(
                         expanded = expandedWrk,
@@ -1161,7 +1300,6 @@ fun AddTaskDialog(
 
                 Spacer(Modifier.height(8.dp))
 
-                // Описание
                 OutlinedTextField(
                     value = description,
                     onValueChange = { description = it },
@@ -1177,8 +1315,8 @@ fun AddTaskDialog(
                     if (selectedObject != null && selectedWorker != null && description.isNotBlank()) {
                         createTask(
                             token,
-                            userId    = selectedWorker!!.id,
-                            objectId  = selectedObject!!.id,
+                            userId = selectedWorker!!.id,
+                            objectId = selectedObject!!.id,
                             description = description
                         )
                         onCreateSuccess()
@@ -1211,11 +1349,45 @@ fun TaskUpdateDialog(
     var menuExpanded by remember { mutableStateOf(false) }
     var note by remember { mutableStateOf<String?>(null) }
     var isLoadingNote by remember { mutableStateOf(false) }
+
+    // New states for names
+    var objectName by remember { mutableStateOf<String?>(null) }
+    var isLoadingObject by remember { mutableStateOf(true) }
+    var workerName by remember { mutableStateOf<String?>(null) }
+    var isLoadingWorker by remember { mutableStateOf(true) }
+    var nameError by remember { mutableStateOf<String?>(null) }
+
     val scope = rememberCoroutineScope()
 
-    // Fetch note when status is "Отклонены"
+    // Fetch object name
+    LaunchedEffect(task.objectId) {
+        isLoadingObject = true
+        nameError = null
+        try {
+            objectName = getObjectName(token, task.objectId)
+        } catch (e: Exception) {
+            nameError = "Ошибка загрузки имени объекта: ${e.message}"
+        } finally {
+            isLoadingObject = false
+        }
+    }
+
+    // Fetch worker name
+    LaunchedEffect(task.userId) {
+        isLoadingWorker = true
+        nameError = null
+        try {
+            workerName = getWorkerName(token, task.userId)
+        } catch (e: Exception) {
+            nameError = "Ошибка загрузки имени работника: ${e.message}"
+        } finally {
+            isLoadingWorker = false
+        }
+    }
+
+    // Fetch note when status is "Отклонено"
     LaunchedEffect(selectedStatus) {
-        if (selectedStatus == 2) {
+        if (selectedStatus != 2) {
             isLoadingNote = true
             note = null
             try {
@@ -1230,9 +1402,9 @@ fun TaskUpdateDialog(
 
     // Status options
     val statusOptions = listOf(
-        0 to "В ожидании",
-        1 to "Выполнены",
-        2 to "Отклонены",
+        0 to "Ожидает",
+        1 to "Сделано",
+        2 to "Отклонено",
         3 to "В работе"
     )
 
@@ -1247,9 +1419,20 @@ fun TaskUpdateDialog(
         },
         text = {
             Column(Modifier.fillMaxWidth()) {
-                Text("ID: ${task.id}", color = Color.Gray)
-                Text("Объект: ${task.objectId}", color = Color.Gray)
-                Text("Работник: ${task.userId}", color = Color.Gray)
+                if (isLoadingObject) {
+                    Text("Объект: загрузка...", color = Color.Gray)
+                } else {
+                    Text("Объект: ${objectName.orEmpty()}", color = Color.Gray)
+                }
+                if (isLoadingWorker) {
+                    Text("Работник: загрузка...", color = Color.Gray)
+                } else {
+                    Text("Работник: ${workerName.orEmpty()}", color = Color.Gray)
+                }
+                nameError?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error)
+                }
+
                 Spacer(Modifier.height(8.dp))
                 Text(
                     text = task.description,
@@ -1290,10 +1473,10 @@ fun TaskUpdateDialog(
                     }
                 }
 
-                // Show reason if status == "Отклонены"
-                if (selectedStatus == 2) {
+                // Show reason if status == "Отклонено"
+                if (selectedStatus != 5 && !note.isNullOrBlank()) {
                     Spacer(Modifier.height(16.dp))
-                    Text("Причина отклонения:", color = Color.White)
+                    Text("Комментарий:", color = Color.White)
                     if (isLoadingNote) {
                         CircularProgressIndicator(
                             modifier = Modifier
@@ -1364,7 +1547,9 @@ fun ObjectDetailDialog(
 ) {
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var showAddTask by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
     AlertDialog(
         onDismissRequest = { if (!isLoading) onDismiss() },
         title = {
@@ -1373,9 +1558,17 @@ fun ObjectDetailDialog(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(text = obj.name, style = MaterialTheme.typography.headlineSmall, color = Color.White)
+                Text(
+                    text = obj.name,
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = Color.White
+                )
                 IconButton(onClick = { if (!isLoading) onDismiss() }) {
-                    Icon(imageVector = Icons.Default.Close, contentDescription = "Закрыть", tint = Color.White)
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Закрыть",
+                        tint = Color.White
+                    )
                 }
             }
         },
@@ -1402,9 +1595,8 @@ fun ObjectDetailDialog(
                             isLoading = true
                             errorMessage = null
                             try {
-                                val response = deleteObject(token, obj.id)
-                                // При необходимости можно проверить response и обработать его
-                                onDeleteSuccess() // Например, закрыть диалог и обновить список
+                                deleteObject(token, obj.id)
+                                onDeleteSuccess()
                             } catch (e: Exception) {
                                 errorMessage = "Ошибка удаления объекта: ${e.message}"
                             } finally {
@@ -1420,10 +1612,33 @@ fun ObjectDetailDialog(
                 ) {
                     Text("Удалить объект", color = Color.White)
                 }
+
+                Button(
+                    onClick = { if (!isLoading) showAddTask = true },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(56.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                    enabled = !isLoading
+                ) {
+                    Text("Создать задачу", color = Color.White)
+                }
             }
         },
         dismissButton = {}
     )
+
+    if (showAddTask) {
+        AddTaskDialog(
+            token = token,
+            initialObject = obj,
+            onDismissRequest = { showAddTask = false },
+            onCreateSuccess = {
+                showAddTask = false
+                onDeleteSuccess()
+            }
+        )
+    }
 }
 
 @Composable
@@ -1566,7 +1781,7 @@ fun MapScreen(
 
                 // Подготовка кастомных иконок
                 val darkGreen = 0xFF2E7D32.toInt()
-                val darkGray  = 0xFF424242.toInt()
+                val darkGray  = 0xFFFF7F50.toInt()
                 fun createCircleMarker(color: Int): BitmapDrawable {
                     val size = 60
                     val strokeW = 4f
@@ -1766,18 +1981,26 @@ fun TaskDetailDialog(
     task: TaskN,
     onTaskUpdated: () -> Unit
 ) {
-    var reason by remember { mutableStateOf("") }
+    var comment by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    // Опции статусов
-    val statusOptions = listOf("В работе", "Ожидание")
-    var selectedStatus by remember { mutableStateOf(statusOptions[0]) }
-    var dropdownExpanded by remember { mutableStateOf(false) }
+    // Цвета и форма кнопок
+    val gray = Color(0xFF9A9A9A)
+    val roundedShape = RoundedCornerShape(8.dp)
 
-    val pastelRed = Color(0xFFE57373)
-    val gray = Color(0xF9A9A9A)
+    // Название объекта
+    var objectName by remember { mutableStateOf("Объект #${task.objectId}") }
+    LaunchedEffect(task.objectId) {
+        scope.launch {
+            objectName = try {
+                getObjectName(token, task.objectId)
+            } catch (e: Exception) {
+                "Объект #${task.objectId}"
+            }
+        }
+    }
 
     AlertDialog(
         onDismissRequest = { if (!isLoading) onTaskUpdated() },
@@ -1791,67 +2014,30 @@ fun TaskDetailDialog(
                     text = "Задача #${task.id}",
                     style = MaterialTheme.typography.headlineSmall
                 )
-                Button(
+                IconButton(
                     onClick = { if (!isLoading) onTaskUpdated() },
-                    contentPadding = PaddingValues(0.dp),
-                    modifier = Modifier.size(24.dp),
                     enabled = !isLoading
                 ) {
-                    Text("X", style = MaterialTheme.typography.bodyLarge)
+                    Icon(Icons.Default.Close, contentDescription = "Закрыть")
                 }
             }
         },
         text = {
             Column(modifier = Modifier.fillMaxWidth()) {
                 Text(text = task.description)
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(text = "Объект: $objectName", style = MaterialTheme.typography.bodyMedium)
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Dropdown для выбора статуса
-                ExposedDropdownMenuBox(
-                    expanded = dropdownExpanded,
-                    onExpandedChange = { dropdownExpanded = !dropdownExpanded }
-                ) {
-                    TextField(
-                        value = selectedStatus,
-                        onValueChange = { /* no-op */ },
-                        readOnly = true,
-                        label = { Text("Статус") },
-                        trailingIcon = {
-                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = dropdownExpanded)
-                        },
-                        singleLine = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .menuAnchor()
-                    )
-                    ExposedDropdownMenu(
-                        expanded = dropdownExpanded,
-                        onDismissRequest = { dropdownExpanded = false }
-                    ) {
-                        statusOptions.forEach { option ->
-                            DropdownMenuItem(
-                                text = { Text(option) },
-                                onClick = {
-                                    selectedStatus = option
-                                    dropdownExpanded = false
-                                }
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                // Поле для ввода причины
+                // Поле для ввода комментария
                 OutlinedTextField(
-                    value = reason,
-                    onValueChange = { reason = it },
-                    placeholder = { Text(text = "Причина") },
+                    value = comment,
+                    onValueChange = { comment = it },
+                    placeholder = { Text(text = "Комментарий") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     isError = errorMessage != null
                 )
-
                 errorMessage?.let {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(text = it, color = MaterialTheme.colorScheme.error)
@@ -1863,20 +2049,15 @@ fun TaskDetailDialog(
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-
+                // В работе
                 Button(
                     onClick = {
                         scope.launch {
                             isLoading = true
                             errorMessage = null
                             try {
-                                val statusCode = when (selectedStatus) {
-                                    "В работе" -> 3
-                                    "Ожидание" -> 0
-                                    else       -> task.status
-                                }
                                 withContext(Dispatchers.IO) {
-                                    updateAssignedTask(token, task, statusCode, reason, context)
+                                    updateAssignedTask(token, task, 3, comment, context)
                                 }
                                 onTaskUpdated()
                             } catch (e: Exception) {
@@ -1888,15 +2069,15 @@ fun TaskDetailDialog(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(56.dp),
-                    shape = MaterialTheme.shapes.small,
+                        .height(48.dp),
+                    shape = roundedShape,
                     colors = ButtonDefaults.buttonColors(containerColor = gray),
                     enabled = !isLoading
                 ) {
-                    Text("Обновить задачу")
+                    Text("В работе")
                 }
 
-                // Завершить задачу (статус = 1)
+                // В ожидании
                 Button(
                     onClick = {
                         scope.launch {
@@ -1904,7 +2085,7 @@ fun TaskDetailDialog(
                             errorMessage = null
                             try {
                                 withContext(Dispatchers.IO) {
-                                    updateAssignedTask(token, task, 1, reason, context)
+                                    updateAssignedTask(token, task, 0, comment, context)
                                 }
                                 onTaskUpdated()
                             } catch (e: Exception) {
@@ -1916,18 +2097,46 @@ fun TaskDetailDialog(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(56.dp),
-                    shape = MaterialTheme.shapes.small,
+                        .height(48.dp),
+                    shape = roundedShape,
+                    colors = ButtonDefaults.buttonColors(containerColor = gray),
+                    enabled = !isLoading
+                ) {
+                    Text("В ожидании")
+                }
+
+                // Готово (завершить)
+                Button(
+                    onClick = {
+                        scope.launch {
+                            isLoading = true
+                            errorMessage = null
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    updateAssignedTask(token, task, 1, comment, context)
+                                }
+                                onTaskUpdated()
+                            } catch (e: Exception) {
+                                errorMessage = "Ошибка обновления: ${e.message}"
+                            } finally {
+                                isLoading = false
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp),
+                    shape = roundedShape,
                     enabled = !isLoading
                 ) {
                     Text("Готово")
                 }
 
-                // Отменить задачу (статус = 2)
+                // Отмена (комментарий обязателен)
                 Button(
                     onClick = {
-                        if (reason.isBlank()) {
-                            errorMessage = "Укажите причину для отмены"
+                        if (comment.isBlank()) {
+                            errorMessage = "Укажите комментарий для отмены"
                             return@Button
                         }
                         scope.launch {
@@ -1935,11 +2144,11 @@ fun TaskDetailDialog(
                             errorMessage = null
                             try {
                                 withContext(Dispatchers.IO) {
-                                    updateAssignedTask(token, task, 2, reason, context)
+                                    updateAssignedTask(token, task, 2, comment, context)
                                 }
                                 onTaskUpdated()
                             } catch (e: Exception) {
-                                errorMessage = "Ошибка обновления: ${e.message}"
+                                errorMessage = "Ошибка отмены: ${e.message}"
                             } finally {
                                 isLoading = false
                             }
@@ -1947,16 +2156,13 @@ fun TaskDetailDialog(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(56.dp),
-                    shape = MaterialTheme.shapes.small,
-                    colors = ButtonDefaults.buttonColors(containerColor = pastelRed),
-                    enabled = !isLoading
+                        .height(48.dp),
+                    shape = roundedShape,
+                    enabled = !isLoading,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE57373))
                 ) {
                     Text("Отмена")
                 }
-
-                // Обновить задачу в соответствии с выбором в Dropdown
-
             }
         },
         dismissButton = { /* нет */ }
@@ -2095,15 +2301,28 @@ fun TaskListPanel(
     val statusMap = listOf(0, 3)
     val titles = listOf("Ожидают", "В работе")
 
-    val panelModifier = if (isExpanded) modifier.fillMaxSize() else modifier.fillMaxWidth().wrapContentHeight()
+    val panelModifier = if (isExpanded) {
+        modifier.fillMaxSize()
+    } else {
+        modifier
+            .fillMaxWidth()
+            .wrapContentHeight()
+    }
 
     Surface(
         modifier = panelModifier,
         color = Color(0xFF212121),
-        tonalElevation = 8.dp
+        tonalElevation = 8.dp,
+        shape = RoundedCornerShape(16.dp)
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            // Header
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 IconButton(onClick = { isExpanded = !isExpanded }) {
                     Icon(
                         imageVector = if (isExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.Menu,
@@ -2111,38 +2330,76 @@ fun TaskListPanel(
                         tint = Color.White
                     )
                 }
-                Text(text = "Список задач", color = Color.White, fontSize = 20.sp, modifier = Modifier.weight(1f))
+                Text(
+                    text = "Список задач",
+                    color = Color.White,
+                    fontSize = 20.sp,
+                    modifier = Modifier.weight(1f)
+                )
             }
 
             if (isExpanded) {
-                Column(modifier = Modifier.fillMaxSize()) {
-                    TabRow(selectedTabIndex = selectedTab, containerColor = Color(0xFF212121), indicator = {}) {
-                        titles.forEachIndexed { idx, title ->
-                            Tab(
-                                selected = selectedTab == idx,
-                                onClick = { selectedTab = idx; taskListRefresh++ },
-                                modifier = Modifier.weight(1f).height(48.dp)
+                // Tabs
+                TabRow(
+                    selectedTabIndex = selectedTab,
+                    containerColor = Color(0xFF212121),
+                    indicator = {}
+                ) {
+                    titles.forEachIndexed { idx, title ->
+                        Tab(
+                            selected = selectedTab == idx,
+                            onClick = {
+                                selectedTab = idx
+                                taskListRefresh++
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(48.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        if (selectedTab == idx) Color(0xFF424242) else Color.Transparent
+                                    ),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Box(
-                                    Modifier.fillMaxSize().background(if (selectedTab == idx) Color(0xFF424242) else Color.Transparent),
-                                    contentAlignment = Alignment.Center
-                                ) { Text(title, color = Color.White) }
+                                Text(title, color = Color.White)
                             }
                         }
                     }
+                }
 
-                    LaunchedEffect(token, taskListRefresh, selectedTab) { tasks = fetchTasks(token, status = statusMap[selectedTab]) }
+                // Load tasks
+                LaunchedEffect(token, taskListRefresh, selectedTab) {
+                    tasks = fetchTasks(token, status = statusMap[selectedTab])
+                }
 
-                    LazyColumn(Modifier.fillMaxSize().padding(8.dp)) {
-                        items(tasks) { task ->
-                            Card(
-                                Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { selectedTask = task },
-                                colors = CardDefaults.cardColors(containerColor = Color(0xFF424242))
-                            ) {
-                                Column(Modifier.padding(16.dp)) {
-                                    Text("Задача #${task.id}", color = Color.White, fontSize = 16.sp)
-                                    Text(task.description, color = Color.White)
-                                }
+                // Task list
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(8.dp)
+                ) {
+                    items(tasks) { task ->
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .clickable { selectedTask = task },
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF424242)),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Text(
+                                    text = "Задача #${task.id}",
+                                    color = Color.White,
+                                    fontSize = 16.sp
+                                )
+                                Text(
+                                    text = task.description,
+                                    color = Color.White
+                                )
                             }
                         }
                     }
@@ -2151,12 +2408,16 @@ fun TaskListPanel(
         }
     }
 
+    // Task detail dialog
     selectedTask?.let { t ->
         TaskDetailDialog(
             context = LocalContext.current,
             token = token,
             task = t,
-            onTaskUpdated = { selectedTask = null }
+            onTaskUpdated = {
+                selectedTask = null
+                taskListRefresh++
+            }
         )
     }
 }
