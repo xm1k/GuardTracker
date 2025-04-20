@@ -1755,7 +1755,7 @@ fun MapScreen(
                     setTileSource(TileSourceFactory.MAPNIK)
                     setMultiTouchControls(true)
                     controller.setZoom(12.0)
-                    controller.setCenter(GeoPoint(56.3269, 44.0059))
+                    controller.setCenter(GeoPoint(57.247235, 60.095613))
 
                     // Скрыть стандартные контролы зума
                     setBuiltInZoomControls(false)
